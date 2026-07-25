@@ -353,8 +353,8 @@ Lint clean. **37 direct tests pass. 4 integration tests pass against real Studio
 | | |
 |---|---|
 | Network | StudioNet (chain id 61999) |
-| Address | `0x587CB7626AEf6Ab4D523f6B59b1653daB1516220` |
-| Studio | https://studio.genlayer.com/?import-contract=0x587CB7626AEf6Ab4D523f6B59b1653daB1516220 |
+| Address | `0x4307441035EDdd5Fe64aAec8321729321c8c498a` |
+| Studio | https://studio.genlayer.com/?import-contract=0x4307441035EDdd5Fe64aAec8321729321c8c498a |
 
 ### Measured on live consensus
 
