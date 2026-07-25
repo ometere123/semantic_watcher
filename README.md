@@ -27,16 +27,68 @@ What is needed is a **judgement**: did anything that actually matters change? An
 
 ## Why this needs GenLayer
 
-The contract fetches the page **itself**, inside a consensus block, and independent validators must agree on what it means. There is no privileged reporter and no signed feed to trust.
+### The trust problem, stated precisely
 
-| | |
+Two or more mutually distrusting parties depend on a single observation of a web page — and that page is very often controlled by **one of them**.
+
+A vendor publishes a service agreement. A customer escrows a deposit against it. Both need an answer to *"did the agreement materially change?"* Neither can be the one who answers it. And the vendor, who controls the page, has an active incentive to make a change look cosmetic.
+
+That is a trust problem, not an information problem. The information is public — anyone can open the URL. What is missing is an **answer nobody can unilaterally author.**
+
+### The counterfactual test
+
+Delete GenLayer from the design and see what survives.
+
+| Approach | What breaks |
 |---|---|
-| **Not** a Chainlink feed | There is no numeric quantity to report. The question is semantic. |
-| **Not** an off-chain watcher | Then the operator decides what "material" means, and you trust them. |
-| **Not** a content hash | Hashes fire on ads and timestamps and stay silent on nothing at all. |
-| **Not** a thin LLM wrapper | The model produces an observation; **consensus** is what makes it usable on-chain. |
+| **Off-chain watcher + signed feed** | The operator decides what "material" means and when a change happened. Every party must trust them. That is the exact trust assumption the escrow existed to remove. |
+| **Chainlink or any price oracle** | There is no numeric quantity to report. "The refund window changed from 30 days to 7" is not a feed value. |
+| **Content hash on-chain** | Ads, session ids, view counters and timestamps change the hash on every request. It fires constantly and proves nothing. |
+| **Deterministic HTML parser** | Breaks the first time the vendor reorders a `<div>`. Worse, a vendor who *wants* to hide a change only has to reword it, and a parser cannot tell "30 days" from "one month". |
+| **Optimistic oracle + human dispute** | Works, but costs days and a bond per observation. Unusable for a watch polled hourly. |
+| **A single LLM call off-chain** | Someone still has to be trusted to have run it honestly and reported the output faithfully. |
 
-This contract never accepts a claim about the world from user-submitted text. Every fact it records was fetched by the contract, from the URL registered in its own storage, inside a consensus block.
+The property that only GenLayer provides: **N independent validators each fetch the page themselves and each form their own judgement, and the transaction only lands if their judgements agree in meaning.** No node is privileged. No party authors the answer. Disagreement is visible rather than silently resolved by whoever was asked.
+
+### Why it is not the patterns that get rejected
+
+| Anti-pattern | Why this is not that |
+|---|---|
+| *"An AI app with GenLayer attached"* | The output is not advice, a recommendation or a summary for a human to read. It is a typed state transition — `version++`, a severity integer, a structured claim diff — consumed programmatically by other contracts. In `examples/sla_guard.py` it releases an escrow. |
+| *"A validator that only checks output format"* | Neither equivalence principle looks at shape. Round 1 requires validators to agree that two claim sets carry the same **information**; round 2 requires the severity integers to **match exactly**. Valid JSON with a different verdict fails consensus. |
+| *"Judging facts from user-submitted text"* | No fact about the world is ever accepted from a caller. The only thing a caller supplies is a URL, and it is **immutable after creation** — there is no `set_url`. Every recorded claim was fetched by the contract, from its own stored URL, inside a consensus block. |
+| *"A thin LLM wrapper"* | The model is one step of five. Around it sit anchored canonicalization, a deterministic digest gate, a severity ladder, monotonic owner constraints, failure semantics that never mutate state, and a subscriber fan-out. Remove the consensus and the contract has no reason to exist; remove the surrounding machinery and the consensus is unusable. |
+
+The output moves money. That is the honest test of whether consensus is decorative here: `SlaGuard` unlocks a deposit on `severity >= 3`. If the observation could be authored by one party, the escrow is worthless.
+
+---
+
+## Why each non-deterministic call is non-deterministic
+
+Only two of the eight write methods enter a consensus block at all: `create_watch` and `poke`. Between them there are exactly **three** non-deterministic operations. Each one is listed here with the reason it cannot be anything else.
+
+| Call | Where | Why it must be non-deterministic |
+|---|---|---|
+| `gl.nondet.web.render(url)` | round 1 | Network I/O. Two nodes fetching the same URL milliseconds apart legitimately receive different bytes. There is no deterministic way for a contract to learn the contents of a web page — the alternative is not "do it deterministically", it is "have someone tell you and trust them". |
+| `gl.nondet.exec_prompt(extraction)` | round 1 | Reducing prose to canonical claims is a language-understanding task. A deterministic parser can extract a `<div>`; it cannot recognise that "you may return items within one month" and "30-day refund window" are the same claim, which is the entire point. Model inference is non-deterministic by construction. |
+| `gl.nondet.exec_prompt(diff)` | round 2 | "Did the meaning change, and does it matter under this policy?" is irreducibly a judgement. There is no total function from two strings to a severity. This is the one question the whole contract exists to answer. |
+
+### What is deliberately **not** non-deterministic
+
+This matters as much as the list above. Every non-deterministic operation is a consensus risk and a cost, so the surface is kept as small as it can be. All of the following run as ordinary deterministic code:
+
+- **The change decision itself.** `digest(claims) == stored_digest` is plain Keccak256 over a sorted claim list, computed outside every consensus block. When a page has not moved, "nothing changed" is a *deterministic* answer that no model participates in.
+- **Access control.** Ownership checks, the monotonic `min_severity` and `cooldown` constraints, the paused check.
+- **Cooldown arithmetic.** Timestamp parsing and comparison.
+- **The severity gate.** `severity >= min_severity` is an integer comparison, not a judgement.
+- **Storage, events, and subscriber fan-out.** Including which subscribers clear their own floor.
+- **All input validation and output sanitisation.** URL scheme, policy length, claim de-duplication, severity clamping, JSON recovery.
+
+The shape to notice: **the model is asked what the page says, never what the contract should do.** Every state transition, every payout-adjacent decision and every access check is deterministic code acting on a consensus-agreed observation.
+
+### Ordering discipline
+
+Inside `poke`, all deterministic guards run *before* the first consensus block — watch exists, not paused, cooldown elapsed. A caller who fails a guard never spends a consensus round. The digest gate then sits *between* the two rounds, so an unchanged page costs one round instead of two.
 
 ---
 
@@ -194,6 +246,60 @@ if not state["reliable"]:
 
 ---
 
+## Why this is reusable
+
+"Reusable" is easy to claim, so here is the falsifiable version: **a consumer contract integrates in one method and needs to understand nothing about consensus.**
+
+### The whole integration surface
+
+```python
+@gl.public.write
+def on_watch_change(self, watch_id, version, severity, summary, diff_json) -> None:
+    if gl.message.sender_address != self.watcher: raise ...
+    if watch_id != self.watch_id: raise ...
+    if int(severity) >= 3:
+        self.unlocked = True
+```
+
+That is it. [`examples/sla_guard.py`](examples/sla_guard.py) is a complete worked consumer — a deposit escrow that releases when a vendor materially rewrites their agreement — and it contains **no web fetching, no prompts, no equivalence principles, no snapshot handling, no JSON parsing, no severity logic.** It reads one integer.
+
+What a consumer never has to learn: how to write an equivalence principle, why `strict_eq` fails on live pages, how to keep validators converging on a canonical form, what to do when a fetch fails, or how to avoid mistaking downtime for deletion. Those are the parts that are hard to get right, and they are exactly the parts that live here instead of being reimplemented per project.
+
+### What makes it a primitive rather than an application
+
+| Property | Why it matters for reuse |
+|---|---|
+| **Zero domain assumptions** | The policy is a natural-language *parameter*, not code. The same deployed contract serves SLA monitoring, licence tracking, ToS insurance and governance-document watching with no change and no redeploy. Nothing about refunds, uptime or licensing appears anywhere in the source. |
+| **One deployment, many watches, many subscribers** | Shared infrastructure. Consumers do not deploy their own copy; they call `create_watch` or `subscribe` on an existing one. Costs and the source-reputation of a watch amortise across everyone using it. |
+| **An event source** | Deliberately the most composable output shape available. A push callback plus a pull-readable `version` means both reactive and polling consumers work without the contract knowing anything about them. |
+| **Safe-by-default trust model** | A consumer does not have to audit the watch owner. The owner's powers are constrained *by the contract* — `min_severity` and `cooldown` may only be lowered, `url` and `policy` have no setter, and the subscriber picks its own severity floor. Reuse is only real if integrating does not require trusting whoever set the watch up. |
+| **Honest failure surface** | One `reliable` flag covers both pausing and degradation. A consumer has exactly one thing to check before treating silence as stability. |
+| **Typed interface** | `IWatchSubscriber` and `ISemanticWatcher` are importable stubs; integration is autocompleted and type-checked rather than stringly-typed. |
+
+### Who would actually use it
+
+Each of these is an existing on-chain need with no current answer, and each needs only the callback above:
+
+- **SLA and uptime escrows** — a status page flips to degraded
+- **Terms-of-service insurance** — a refund or liability clause is rewritten
+- **DAO treasury guards** — a partner's governance document changes
+- **Licence compliance** — upstream licensing terms shift under a dependency
+- **Delisting and depeg detection** — an announcement lands before any price moves
+- **Regulatory monitoring** — a published rule or threshold is amended
+
+None of these are variations on one demo. They differ only in the policy string.
+
+### The honest limits
+
+Reuse claims should come with the cases where reuse is a bad idea:
+
+- **Not for high-frequency data.** Two consensus rounds per change is the wrong tool for anything that moves per-block. Use a price feed.
+- **Not for pages behind auth or heavy JavaScript.** `render` handles a lot, but a login wall stops it.
+- **Round 1 does not always converge on the first attempt.** Observation rounds occasionally return `UNDETERMINED`; the transaction writes nothing and the call must be retried. Treat `create_watch` and `poke` as retryable.
+- **Pausing remains an owner power.** It cannot be removed without letting a griefing subscriber lock an owner in permanently. It is made loud instead — hence `reliable`.
+
+---
+
 ## Using it
 
 ### As a subscriber
@@ -272,19 +378,6 @@ There is deliberately no `set_url` and no `update_policy`.
 
 ---
 
-## What it is good for
-
-- **SLA and uptime contracts** — a status page flips to degraded
-- **Terms-of-service insurance** — a refund or liability clause is rewritten
-- **DAO treasury guards** — a partner's governance document changes
-- **License compliance** — upstream licensing terms shift
-- **Delisting and depeg detection** — announcements that precede any price move
-- **Regulatory monitoring** — a published rule or threshold is amended
-
-The shape is deliberately the most composable one available: an event source.
-
----
-
 ## Development
 
 ```bash
@@ -355,6 +448,9 @@ Lint clean. **37 direct tests pass. 4 integration tests pass against real Studio
 | Network | StudioNet (chain id 61999) |
 | Address | `0x4307441035EDdd5Fe64aAec8321729321c8c498a` |
 | Studio | https://studio.genlayer.com/?import-contract=0x4307441035EDdd5Fe64aAec8321729321c8c498a |
+| Explorer | https://explorer-studio.genlayer.com/address/0x4307441035EDdd5Fe64aAec8321729321c8c498a |
+
+All 8 write methods have been executed against this deployment, so the explorer shows the complete surface rather than a deploy and one call: `create_watch` ×2, `subscribe`, `unsubscribe`, `set_min_severity`, `set_cooldown`, `set_active` ×2, `poke`, `transfer_watch`. Watch #1 is live; watch #2 was created solely to demonstrate `transfer_watch` and now belongs to `0x1111…1111`.
 
 ### Measured on live consensus
 
@@ -371,7 +467,25 @@ A watch on `https://example.com/` with the policy *"The stated purpose of this d
 
 Digest `71e196e221894a2188c28732e949ead0495ded776abacddbd669b9a47beab2d8`, **identical across three consecutive polls** — the deterministic gate fires and the classification round is skipped, exactly as designed.
 
-Observed validator behaviour is worth stating plainly: individual votes include occasional `DISAGREE` and `IDLE`. Transactions still reach `ACCEPTED` on quorum. This is the equivalence principle doing its job on a genuinely non-deterministic observation, not a defect — but it does mean a watch should be sized with the expectation that not every validator agrees on every poll.
+### Observed consensus behaviour
+
+Stated plainly, because anyone building on this should know it before they hit it:
+
+- Individual validator votes routinely include `DISAGREE` and `IDLE`. Transactions still reach `ACCEPTED` on quorum. This is the equivalence principle doing its job on a genuinely non-deterministic observation.
+- **An observation round can return `UNDETERMINED`**, meaning the validator set did not reach agreement. Nothing is written — no watch is created, no snapshot advances, no counter moves — and the call simply has to be retried. Observed once across the runs recorded here; the retry succeeded with `AGREE, AGREE, IDLE, IDLE, AGREE`.
+- Deterministic writes (`subscribe`, `set_active`, `transfer_watch`, …) do not have this behaviour. Only `create_watch` and `poke` enter a consensus block.
+
+Treat the two non-deterministic writes as **retryable**, not as guaranteed-first-attempt. A failed consensus round is safe — it is indistinguishable from never having called.
+
+### Full public surface, exercised on chain
+
+`tests/integration/test_full_surface.py` drives all 8 write methods and reads all 7 views against live consensus in one run, printing state after each step. It also asserts the negative cases: raising `min_severity` refused, raising `cooldown` refused, double-subscribe refused, poking a paused watch refused, the previous owner locked out after transfer, and the new owner still unable to raise `min_severity`.
+
+```
+gltest tests/integration/test_full_surface.py -v -s --network studionet
+```
+
+This is the fastest way for a reviewer to confirm that nothing in the contract is decorative.
 
 ### Roadmap
 

@@ -578,6 +578,36 @@ class SemanticWatcher(gl.Contract):
     # block and nothing else. Keeping them isolated means no storage write,
     # message emission or nested non-deterministic call can ever end up inside
     # a consensus block by accident.
+    #
+    # These two methods contain the ONLY non-determinism in the contract --
+    # three operations in total, each of which has no deterministic form:
+    #
+    #   gl.nondet.web.render      network I/O. Two nodes fetching the same URL
+    #                             milliseconds apart legitimately receive
+    #                             different bytes. The alternative to fetching
+    #                             is not "fetch deterministically", it is "have
+    #                             someone tell you and trust them".
+    #
+    #   exec_prompt (extract)     reducing prose to canonical claims is a
+    #                             language-understanding task. A deterministic
+    #                             parser can pull a <div>; it cannot see that
+    #                             "returns within one month" and "30-day refund
+    #                             window" are the same claim, which is the
+    #                             entire point.
+    #
+    #   exec_prompt (classify)    "did the meaning change, and does it matter
+    #                             under this policy" is irreducibly a
+    #                             judgement. There is no total function from
+    #                             two strings to a severity.
+    #
+    # Everything else is deterministic on purpose: the digest gate that decides
+    # whether anything changed at all, access control, cooldown arithmetic, the
+    # severity comparison, storage, events and subscriber fan-out.
+    #
+    # The shape to notice is that the model is asked what the page *says*, and
+    # never what the contract should *do*. Every state transition and every
+    # payout-adjacent decision is deterministic code acting on an observation
+    # the validator set has already agreed on.
 
     def _observe(
         self,
