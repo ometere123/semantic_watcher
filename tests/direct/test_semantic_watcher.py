@@ -414,6 +414,35 @@ def test_ownership_transfer_moves_control(
     assert contract.get_watch(watch_id)["active"] is False
 
 
+def test_transfer_accepts_a_hex_string_address(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Calldata off the wire delivers addresses as hex strings, not Address.
+
+    A direct-mode test that hands over a hand-built Address hides this: the
+    contract passed here while failing on a real network with
+    "AttributeError: 'str' object has no attribute 'as_bytes'".
+    """
+    direct_vm.sender = direct_alice
+    contract, watch_id = baseline(direct_vm, direct_deploy)
+
+    new_owner = str(as_address(direct_bob))
+    contract.transfer_watch(watch_id, new_owner)
+
+    assert contract.get_watch(watch_id)["owner"].lower() == new_owner.lower()
+
+
+def test_transfer_to_the_zero_address_is_refused(
+    direct_vm, direct_deploy, direct_alice
+):
+    """Transferring to zero would strand the watch with no owner forever."""
+    direct_vm.sender = direct_alice
+    contract, watch_id = baseline(direct_vm, direct_deploy)
+
+    with direct_vm.expect_revert("EXPECTED"):
+        contract.transfer_watch(watch_id, "0x" + "0" * 40)
+
+
 def test_unknown_watch_is_rejected(direct_vm, direct_deploy):
     contract = direct_deploy(CONTRACT)
     with direct_vm.expect_revert("EXPECTED"):

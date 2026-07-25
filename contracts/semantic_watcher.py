@@ -952,9 +952,31 @@ class SemanticWatcher(gl.Contract):
 
     @gl.public.write
     def transfer_watch(self, watch_id: u256, new_owner: Address) -> None:
+        """Hand a watch to a new owner.
+
+        The parameter is annotated ``Address``, but calldata off the wire
+        arrives as a hex string and is *not* coerced before it reaches
+        storage -- assigning it directly raises
+        ``AttributeError: 'str' object has no attribute 'as_bytes'`` on a real
+        network while passing happily in direct-mode tests that construct an
+        Address by hand. Normalise here rather than trusting the annotation.
+        """
         watch = self._require_watch(watch_id)
         self._require_owner(watch)
-        watch.owner = new_owner
+
+        try:
+            owner = new_owner if isinstance(new_owner, Address) else Address(new_owner)
+        except Exception as exc:
+            raise gl.vm.UserError(f"{ERR_EXPECTED}: invalid new_owner: {exc}")
+
+        # Address.ZERO is documented but absent in SDK v0.2.16, so compare the
+        # raw bytes rather than depending on the constant.
+        if bytes(owner.as_bytes) == b"\x00" * Address.SIZE:
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED}: refusing to transfer a watch to the zero address"
+            )
+
+        watch.owner = owner
 
     # -- views --------------------------------------------------------------
 

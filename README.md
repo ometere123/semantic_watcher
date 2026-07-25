@@ -311,7 +311,7 @@ gltest tests/integration/ -v -s --network studionet
 
 ### Test coverage
 
-35 direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
+37 direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
 
 | Area | Cases |
 |---|---|
@@ -346,7 +346,7 @@ tests/conftest.py               host workarounds only
 
 ## Status
 
-Lint clean. **35 direct tests pass. 3 integration tests pass against real StudioNet consensus.**
+Lint clean. **37 direct tests pass. 4 integration tests pass against real StudioNet consensus**, including a full-surface run that exercises all 8 writes and reads all 7 views.
 
 ### Deployed
 
