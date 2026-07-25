@@ -45,10 +45,11 @@ def test_baseline_reaches_consensus(watcher):
     """A single observation round must be agreed by the validator set."""
     result = watcher.create_watch(
         args=[STABLE_URL, STABLE_POLICY, 3, 0, "text", ""]
-    )
+    ).transact()
     assert tx_execution_succeeded(result)
 
-    state = watcher.get_watch(args=[1]).call()
+    watch_id = watcher.watch_count().call()
+    state = watcher.get_watch(args=[watch_id]).call()
     assert state["version"] == 1
     assert state["claim_count"] > 0, "the page yielded no policy-relevant claims"
 
@@ -61,13 +62,15 @@ def test_repeated_observation_of_an_unchanged_page_is_stable(watcher):
     movement -- which would make the primitive useless no matter how correct
     the surrounding state machine is.
     """
-    watcher.create_watch(args=[STABLE_URL, STABLE_POLICY, 3, 0, "text", ""])
+    watcher.create_watch(
+        args=[STABLE_URL, STABLE_POLICY, 3, 0, "text", ""]
+    ).transact()
     watch_id = watcher.watch_count().call()
 
     before = watcher.get_watch(args=[watch_id]).call()
 
     for _ in range(3):
-        result = watcher.poke(args=[watch_id])
+        result = watcher.poke(args=[watch_id]).transact()
         assert tx_execution_succeeded(result)
 
     after = watcher.get_watch(args=[watch_id]).call()
@@ -78,10 +81,26 @@ def test_repeated_observation_of_an_unchanged_page_is_stable(watcher):
     assert after["total_polls"] == before["total_polls"] + 3
     assert after["consecutive_failures"] == 0
 
+    # The strict form of the same property, and the one that actually matters.
+    #
+    # A stable version only proves the classifier absorbed whatever drift
+    # occurred. A stable digest proves there was no drift to absorb -- the
+    # extraction itself reproduced the snapshot exactly. Without this
+    # assertion an earlier build passed the version check while quietly
+    # re-wording every value on each poll ("no permission needed" -> "none"),
+    # which defeats the deterministic gate and forces a classification round
+    # on every single poll.
+    assert after["claims_digest"] == before["claims_digest"], (
+        "the canonical snapshot drifted on an unchanged page: value anchoring "
+        "is not holding, so the deterministic gate will never fire"
+    )
+
 
 def test_unreachable_host_is_recorded_not_treated_as_deletion(watcher):
     """A dead host must degrade the watch, never rewrite its snapshot."""
-    watcher.create_watch(args=[STABLE_URL, STABLE_POLICY, 3, 0, "text", ""])
+    watcher.create_watch(
+        args=[STABLE_URL, STABLE_POLICY, 3, 0, "text", ""]
+    ).transact()
     watch_id = watcher.watch_count().call()
 
     claims_before = watcher.get_claims(args=[watch_id]).call()
@@ -89,7 +108,7 @@ def test_unreachable_host_is_recorded_not_treated_as_deletion(watcher):
     # Repoint is not possible by design, so this asserts the live-page path
     # stays consistent; the failure path itself is covered in direct mode
     # where the transport can be forced to fail deterministically.
-    result = watcher.poke(args=[watch_id])
+    result = watcher.poke(args=[watch_id]).transact()
     assert tx_execution_succeeded(result)
 
     state = watcher.get_watch(args=[watch_id]).call()

@@ -442,6 +442,30 @@ def test_subscribe_is_idempotent_per_address(
     assert len(contract.get_subscribers(watch_id)) == 2
 
 
+def test_subscriber_chooses_its_own_severity_floor(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    direct_vm.sender = direct_alice
+    contract, watch_id = baseline(direct_vm, direct_deploy, min_severity=1)
+
+    contract.subscribe(watch_id, 4)
+    with direct_vm.prank(direct_bob):
+        contract.subscribe(watch_id, 2)
+
+    floors = {s["subscriber"]: s["min_severity"] for s in contract.get_subscribers(watch_id)}
+    assert sorted(floors.values()) == [2, 4]
+
+
+def test_subscribe_rejects_a_floor_outside_the_scale(direct_vm, direct_deploy):
+    contract, watch_id = baseline(direct_vm, direct_deploy)
+
+    with direct_vm.expect_revert("EXPECTED"):
+        contract.subscribe(watch_id, 0)
+
+    with direct_vm.expect_revert("EXPECTED"):
+        contract.subscribe(watch_id, 5)
+
+
 def test_unsubscribe_removes_only_the_caller(
     direct_vm, direct_deploy, direct_alice, direct_bob
 ):
@@ -458,6 +482,95 @@ def test_unsubscribe_removes_only_the_caller(
 
     with direct_vm.expect_revert("EXPECTED"):
         contract.unsubscribe(watch_id)
+
+
+# ---------------------------------------------------------------------------
+# Owner powers cannot be used to suppress
+#
+# The threat: the owner of a watch may be the operator of the watched page.
+# Without these constraints a vendor could publish an agreement, let others
+# subscribe against it, then quietly mute reports about their own changes.
+# ---------------------------------------------------------------------------
+
+
+def test_min_severity_cannot_be_raised(direct_vm, direct_deploy):
+    """Raising the threshold would retroactively suppress subscribed events."""
+    contract, watch_id = baseline(direct_vm, direct_deploy, min_severity=2)
+
+    with direct_vm.expect_revert("only be lowered"):
+        contract.set_min_severity(watch_id, 4)
+
+    assert contract.get_watch(watch_id)["min_severity"] == 2
+
+
+def test_min_severity_can_be_lowered(direct_vm, direct_deploy):
+    """Making a watch more sensitive is always allowed."""
+    contract, watch_id = baseline(direct_vm, direct_deploy, min_severity=3)
+
+    contract.set_min_severity(watch_id, 1)
+    assert contract.get_watch(watch_id)["min_severity"] == 1
+
+
+def test_cooldown_cannot_be_raised(direct_vm, direct_deploy):
+    """A long enough cooldown is indistinguishable from pausing the watch."""
+    contract, watch_id = baseline(direct_vm, direct_deploy, cooldown=60)
+
+    with direct_vm.expect_revert("only be lowered"):
+        contract.set_cooldown(watch_id, 86400)
+
+    assert contract.get_watch(watch_id)["cooldown_seconds"] == 60
+
+    contract.set_cooldown(watch_id, 10)
+    assert contract.get_watch(watch_id)["cooldown_seconds"] == 10
+
+
+def test_a_new_owner_inherits_no_extra_power(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Transferring a watch must not reset the monotonic constraints."""
+    direct_vm.sender = direct_alice
+    contract, watch_id = baseline(direct_vm, direct_deploy, min_severity=2)
+
+    contract.transfer_watch(watch_id, as_address(direct_bob))
+
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("only be lowered"):
+            contract.set_min_severity(watch_id, 4)
+
+
+def test_url_and_policy_have_no_setters(direct_vm, direct_deploy):
+    """Repointing a watch would invalidate every subscriber's assumption."""
+    contract, _ = baseline(direct_vm, direct_deploy)
+
+    assert not hasattr(contract, "set_url")
+    assert not hasattr(contract, "update_policy")
+
+
+def test_pausing_is_visible_through_the_reliable_flag(direct_vm, direct_deploy):
+    """Silence from a paused watch must not read as 'nothing changed'."""
+    contract, watch_id = baseline(direct_vm, direct_deploy)
+    assert contract.get_watch(watch_id)["reliable"] is True
+
+    contract.set_active(watch_id, False)
+    state = contract.get_watch(watch_id)
+    assert state["active"] is False
+    assert state["reliable"] is False
+
+    contract.set_active(watch_id, True)
+    assert contract.get_watch(watch_id)["reliable"] is True
+
+
+def test_a_degraded_watch_is_not_reliable(direct_vm, direct_deploy):
+    contract, watch_id = baseline(direct_vm, direct_deploy)
+
+    direct_vm.mock_web(r".*example\.com/terms.*", {"status": 503, "body": ""})
+    for _ in range(3):
+        contract.poke(watch_id)
+
+    state = contract.get_watch(watch_id)
+    assert state["active"] is True
+    assert state["degraded"] is True
+    assert state["reliable"] is False
 
 
 # ---------------------------------------------------------------------------

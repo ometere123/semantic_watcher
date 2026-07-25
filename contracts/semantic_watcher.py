@@ -72,6 +72,20 @@ class ChangeRecord:
 
 @allow_storage
 @dataclass
+class Subscription:
+    """A subscriber and the severity floor *they* chose.
+
+    The threshold lives with the subscriber rather than the watch so that the
+    watch owner cannot decide, after the fact, what a subscriber is allowed to
+    hear about.
+    """
+
+    subscriber: Address
+    min_severity: u8
+
+
+@allow_storage
+@dataclass
 class Watch:
     owner: Address
     url: str
@@ -91,7 +105,7 @@ class Watch:
 
     claims: DynArray[Claim]
     history: DynArray[ChangeRecord]
-    subscribers: DynArray[Address]
+    subscribers: DynArray[Subscription]
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +156,20 @@ class WatchDegraded(gl.Event):
     def __init__(self, watch_id: u256, /, **blob): ...
 
 
+class WatchActiveChanged(gl.Event):
+    """Emitted whenever observation is paused or resumed.
+
+    Pausing is the one owner power that can still starve a subscriber of
+    events, so it is made loudly visible rather than silent.
+    """
+
+    def __init__(self, watch_id: u256, active: bool, /, **blob): ...
+
+
+class WatchSensitivityChanged(gl.Event):
+    def __init__(self, watch_id: u256, min_severity: u8, /, **blob): ...
+
+
 # ---------------------------------------------------------------------------
 # Prompt construction
 #
@@ -151,26 +179,44 @@ class WatchDegraded(gl.Event):
 
 
 def build_extraction_prompt(
-    page_text: str, policy: str, anchor_keys: list[str]
+    page_text: str, policy: str, anchors: list[dict]
 ) -> str:
     """Prompt for round 1: page -> canonical claim set.
 
-    ``anchor_keys`` is what makes independent validators converge. Without it
-    each node invents its own naming for the same claim and the diff is pure
-    noise.
+    ``anchors`` is the previously agreed claim set, and it is what makes
+    independent validators converge. Both halves matter, and measurements on
+    live consensus showed why:
+
+    * Anchoring **keys** stops each node inventing its own naming for the same
+      claim (``refund_window`` vs ``refund_period`` vs ``return_window``).
+    * Anchoring **values** stops equivalent phrasings drifting on every poll
+      ("no permission needed" -> "none"). Without it the snapshot digest
+      changes even when the page has not, which defeats the deterministic gate
+      and forces a classification round on every single poll.
     """
 
-    if len(anchor_keys) > 0:
+    if len(anchors) > 0:
         anchor_block = (
-            "ESTABLISHED KEYS (reuse these exactly whenever the underlying "
-            "claim is still present on the page, even if its wording changed):\n"
-            + "\n".join("- " + k for k in anchor_keys)
+            "ESTABLISHED CLAIMS from the last agreed snapshot:\n"
+            + "\n".join(
+                f'- {a["key"]}: {a["value"]}' for a in anchors
+            )
+            + "\n\nANCHORING RULES -- these take priority over style:\n"
+            "a. Reuse an established key verbatim whenever that claim is still "
+            "present, even if the page has reworded it.\n"
+            "b. If an established claim is still true in substance, reproduce "
+            "its previous value VERBATIM. Do not rephrase, expand, abbreviate "
+            "or re-normalise wording you would otherwise have written "
+            "differently. Character-for-character reuse is required.\n"
+            "c. Only write a new value when the substance itself has changed. "
+            "A different value is a signal that something really moved, so it "
+            "must never be caused by style alone."
         )
     else:
         anchor_block = (
-            "There are no established keys yet. Invent stable, descriptive "
-            "snake_case keys that will still make sense on future revisions of "
-            "this page."
+            "There are no established claims yet. Invent stable, descriptive "
+            "snake_case keys and concise values that will still make sense on "
+            "future revisions of this page."
         )
 
     return f"""You extract a canonical, machine-comparable snapshot of a web page.
@@ -181,8 +227,8 @@ POLICY -- only extract claims relevant to this concern:
 {anchor_block}
 
 RULES
-1. Reuse an established key verbatim if that claim still exists. Only create a
-   new key for a genuinely new claim.
+1. Follow the anchoring rules above before anything else. Stability across
+   polls matters more than the wording you would otherwise prefer.
 2. If an established claim has disappeared from the page, omit it. Do not
    guess and do not carry it forward.
 3. Normalise values: strip marketing language, collapse whitespace, use plain
@@ -537,7 +583,7 @@ class SemanticWatcher(gl.Contract):
         self,
         url: str,
         policy: str,
-        anchor_keys: list[str],
+        anchors: list[dict],
         render_mode: str,
         wait_after_loaded: str,
     ) -> dict:
@@ -562,7 +608,7 @@ class SemanticWatcher(gl.Contract):
             try:
                 raw = gl.nondet.exec_prompt(
                     build_extraction_prompt(
-                        page_text[:MAX_PAGE_CHARS], policy, anchor_keys
+                        page_text[:MAX_PAGE_CHARS], policy, anchors
                     ),
                     response_format="text",
                 )
@@ -608,8 +654,13 @@ class SemanticWatcher(gl.Contract):
         return remaining if remaining > 0 else 0
 
     def _notify(self, watch: Watch, watch_id: u256, record: ChangeRecord) -> None:
-        for subscriber in watch.subscribers:
-            IWatchSubscriber(subscriber).emit(on="finalized").on_watch_change(
+        """Deliver a change to every subscriber whose own floor it clears."""
+        for entry in watch.subscribers:
+            if int(record.severity) < int(entry.min_severity):
+                continue
+            IWatchSubscriber(entry.subscriber).emit(
+                on="finalized"
+            ).on_watch_change(
                 watch_id,
                 record.version,
                 record.severity,
@@ -711,11 +762,12 @@ class SemanticWatcher(gl.Contract):
         render_mode = str(watch.render_mode)
         wait_after_loaded = str(watch.wait_after_loaded)
         before = self._claims_to_list(watch)
-        anchor_keys = [c["key"] for c in before]
 
         # --- round 1: fetch + canonicalise ---------------------------------
+        # The previous snapshot is fed back in as the anchor, keys and values
+        # both, so an unchanged page reproduces an identical claim set.
         observed = self._observe(
-            url, policy, anchor_keys, render_mode, wait_after_loaded
+            url, policy, before, render_mode, wait_after_loaded
         )
 
         watch.total_polls = u32(int(watch.total_polls) + 1)
@@ -780,8 +832,18 @@ class SemanticWatcher(gl.Contract):
     # -- subscriptions ------------------------------------------------------
 
     @gl.public.write
-    def subscribe(self, watch_id: u256) -> None:
-        """Register the caller for change callbacks on this watch."""
+    def subscribe(self, watch_id: u256, min_severity: int = SEV_MATERIAL) -> None:
+        """Register the caller for change callbacks at a severity they choose.
+
+        The floor belongs to the subscriber. A watch owner can make the watch
+        more sensitive over time but can never raise a subscriber's threshold,
+        so the notifications you sign up for are the ones you keep getting.
+        """
+
+        if min_severity < SEV_COSMETIC or min_severity > MAX_SEVERITY:
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED}: min_severity must be {SEV_COSMETIC}..{MAX_SEVERITY}"
+            )
 
         watch = self._require_watch(watch_id)
         if len(watch.subscribers) >= MAX_SUBSCRIBERS:
@@ -789,47 +851,103 @@ class SemanticWatcher(gl.Contract):
 
         caller = gl.message.sender_address
         for existing in watch.subscribers:
-            if existing == caller:
+            if existing.subscriber == caller:
                 raise gl.vm.UserError(f"{ERR_EXPECTED}: already subscribed")
-        watch.subscribers.append(caller)
+
+        entry = watch.subscribers.append_new_get()
+        entry.subscriber = caller
+        entry.min_severity = u8(min_severity)
 
     @gl.public.write
     def unsubscribe(self, watch_id: u256) -> None:
         watch = self._require_watch(watch_id)
         caller = gl.message.sender_address
 
-        retained = [a for a in watch.subscribers if a != caller]
+        retained = [
+            (e.subscriber, int(e.min_severity))
+            for e in watch.subscribers
+            if e.subscriber != caller
+        ]
         if len(retained) == len(watch.subscribers):
             raise gl.vm.UserError(f"{ERR_EXPECTED}: not subscribed")
 
         watch.subscribers.clear()
-        for address in retained:
-            watch.subscribers.append(address)
+        for address, floor in retained:
+            entry = watch.subscribers.append_new_get()
+            entry.subscriber = address
+            entry.min_severity = u8(floor)
 
     # -- owner controls -----------------------------------------------------
 
+    # Owner controls follow one rule: they may only ever make a watch *more*
+    # responsive. Anything a subscriber relies on must be impossible to walk
+    # back, otherwise the owner of a watched page could quietly mute reports
+    # about their own page after others have committed to it.
+    #
+    # url and policy are immutable by construction -- there is deliberately no
+    # setter for either. Pausing is the one remaining lever that can starve a
+    # subscriber, so it stays available but is made loud and observable.
+
     @gl.public.write
     def set_active(self, watch_id: u256, active: bool) -> None:
+        """Pause or resume observation.
+
+        Pausing cannot be silent: it emits an event and flips ``reliable`` to
+        false in ``get_watch``. Subscribers must treat a paused watch the same
+        way they treat a degraded one -- as an absence of information, not as
+        evidence that nothing changed.
+        """
         watch = self._require_watch(watch_id)
         self._require_owner(watch)
+        if bool(watch.active) == active:
+            return
         watch.active = active
+        WatchActiveChanged(watch_id, active).emit()
 
     @gl.public.write
     def set_min_severity(self, watch_id: u256, min_severity: int) -> None:
+        """Lower the recording threshold. Raising it is refused.
+
+        Raising would retroactively suppress changes that existing subscribers
+        subscribed in order to hear about. Owners who want a narrower feed
+        should create a second watch; subscribers pick their own floor when
+        they subscribe.
+        """
         if min_severity < SEV_COSMETIC or min_severity > MAX_SEVERITY:
             raise gl.vm.UserError(
                 f"{ERR_EXPECTED}: min_severity must be {SEV_COSMETIC}..{MAX_SEVERITY}"
             )
         watch = self._require_watch(watch_id)
         self._require_owner(watch)
+
+        if min_severity > int(watch.min_severity):
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED}: min_severity may only be lowered "
+                f"(current {int(watch.min_severity)}, requested {min_severity})"
+            )
+        if min_severity == int(watch.min_severity):
+            return
+
         watch.min_severity = u8(min_severity)
+        WatchSensitivityChanged(watch_id, u8(min_severity)).emit()
 
     @gl.public.write
     def set_cooldown(self, watch_id: u256, cooldown_seconds: int) -> None:
+        """Shorten the polling interval. Lengthening it is refused.
+
+        A long enough cooldown is indistinguishable from pausing the watch, so
+        it is constrained the same way as the severity threshold.
+        """
         if cooldown_seconds < 0:
             raise gl.vm.UserError(f"{ERR_EXPECTED}: cooldown_seconds must be >= 0")
         watch = self._require_watch(watch_id)
         self._require_owner(watch)
+
+        if cooldown_seconds > int(watch.cooldown_seconds):
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED}: cooldown_seconds may only be lowered "
+                f"(current {int(watch.cooldown_seconds)}, requested {cooldown_seconds})"
+            )
         watch.cooldown_seconds = u64(cooldown_seconds)
 
     @gl.public.write
@@ -843,6 +961,7 @@ class SemanticWatcher(gl.Contract):
     @gl.public.view
     def get_watch(self, watch_id: u256) -> dict:
         watch = self._require_watch(watch_id)
+        degraded = int(watch.consecutive_failures) >= FAILURE_DEGRADE_THRESHOLD
         return {
             "owner": str(watch.owner),
             "url": str(watch.url),
@@ -859,7 +978,10 @@ class SemanticWatcher(gl.Contract):
             "total_polls": int(watch.total_polls),
             "claim_count": len(watch.claims),
             "subscriber_count": len(watch.subscribers),
-            "degraded": int(watch.consecutive_failures) >= FAILURE_DEGRADE_THRESHOLD,
+            "degraded": degraded,
+            # One flag consumers should gate on. Silence from an unreliable
+            # watch means "we do not know", never "nothing changed".
+            "reliable": bool(watch.active) and not degraded,
         }
 
     @gl.public.view
@@ -898,7 +1020,13 @@ class SemanticWatcher(gl.Contract):
     @gl.public.view
     def get_subscribers(self, watch_id: u256) -> list:
         watch = self._require_watch(watch_id)
-        return [str(a) for a in watch.subscribers]
+        return [
+            {
+                "subscriber": str(e.subscriber),
+                "min_severity": int(e.min_severity),
+            }
+            for e in watch.subscribers
+        ]
 
     @gl.public.view
     def is_due(self, watch_id: u256) -> bool:

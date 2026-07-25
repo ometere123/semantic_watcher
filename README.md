@@ -86,9 +86,21 @@ The page is fetched inside the consensus block and reduced to an ordered set of 
 
 Making independent validators produce the *same* snapshot from the same page is the load-bearing problem in this design. Left alone, each node invents its own naming for the same claim — `refund_window` vs `refund_period` vs `return_window` — and the diff becomes pure noise. Nothing downstream can survive that.
 
-The fix: **the previously agreed claim keys are fed back into the extraction prompt**, and the model is required to reuse an existing key whenever the underlying claim still exists. Keys stay stable across polls instead of being re-invented on every run.
+The fix: **the previously agreed claim set is fed back into the extraction prompt as an anchor**, both keys and values. The model must reuse an existing key whenever the claim still exists, and must reproduce the previous value *verbatim* when the substance is unchanged.
 
-This is why the baseline snapshot is taken during `create_watch` rather than lazily. Without a baseline there are no anchors, and the first poll would report the entire page as new.
+Both halves are load-bearing, and measurement on live consensus is what proved it. An earlier build anchored keys only. Polling an unchanged page produced:
+
+| key | poll 1 | poll 2 |
+|---|---|---|
+| `domain_purpose` | "for use in documentation examples" | "documentation examples" |
+| `permission_required` | "no permission needed" | "none" |
+| `usage_restriction` | "avoid use in operations" | "avoid use in operations" |
+
+Keys were perfectly stable — key anchoring worked. But values drifted in phrasing, so the digest changed on every poll, the deterministic gate never fired, and a classification round ran every time. The version never bumped (round 2 correctly absorbed the drift), so the failure was invisible to any test that only checked for false events.
+
+With value anchoring added, three consecutive polls of the same page produce a byte-identical digest and the gate fires as designed. `tests/integration/` now asserts digest stability, not just version stability.
+
+This is also why the baseline snapshot is taken during `create_watch` rather than lazily. Without a baseline there are no anchors, and the first poll would report the entire page as new.
 
 ### The deterministic gate
 
@@ -148,6 +160,38 @@ Storage values are copied into plain Python locals before any non-deterministic 
 **Everything unbounded is capped.**
 64 claims, 32 history records (ring buffer), 32 subscribers, 24000 page characters. On-chain storage is not free and unbounded growth turns a cheap `poke()` into an unpayable one.
 
+**The watch owner cannot suppress what subscribers signed up for.**
+This one deserves its own section — see below.
+
+---
+
+## The suppression problem
+
+The owner of a watch may well be the operator of the watched page. A vendor publishes a service agreement, lets counterparties subscribe against it, and then quietly mutes reports about their own changes. Every owner power has to be examined against that threat.
+
+The rule: **owner controls may only ever make a watch more responsive, never less.**
+
+| Power | Constraint |
+|---|---|
+| `url` | **No setter.** Repointing a watch would invalidate every subscriber's assumption about what is being observed. |
+| `policy` | **No setter.** Same reasoning — the policy defines what "material" means. |
+| `set_min_severity` | **May only be lowered.** Raising it would retroactively suppress changes subscribers subscribed in order to hear. Owners wanting a narrower feed create a second watch. |
+| `set_cooldown` | **May only be lowered.** A long enough cooldown is indistinguishable from pausing. |
+| `set_active` | Pausing stays available, but **cannot be silent**: it emits `WatchActiveChanged` and flips `reliable` to false. |
+| `transfer_watch` | A new owner inherits the same monotonic constraints — no reset. |
+
+On top of that, **the severity floor belongs to the subscriber, not the watch.** `subscribe(watch_id, min_severity)` records the threshold you chose, and nothing the owner does can raise it.
+
+The one residual power is pausing. It is deliberately not removed — blocking it while subscribers exist would let a griefer lock an owner in permanently. Instead it is made loud, which is why consumers must gate on `reliable`:
+
+```python
+state = watcher.view().get_watch(watch_id)
+if not state["reliable"]:
+    ...   # paused or degraded: we do not know, so do not assume stability
+```
+
+**Silence from an unreliable watch means "we do not know", never "nothing changed."**
+
 ---
 
 ## Using it
@@ -186,13 +230,13 @@ What the example contract does **not** contain is the point: no web fetching, no
 watcher = ISemanticWatcher(watcher_address)
 state = watcher.view().get_watch(watch_id)
 
-if state["degraded"]:
-    ...            # the feed is stale; do not treat silence as stability
+if not state["reliable"]:
+    ...            # paused or degraded; do not treat silence as stability
 elif state["version"] > self.last_seen_version:
     ...            # something material happened
 ```
 
-Always check `degraded` before treating an absence of events as evidence that nothing changed.
+Always check `reliable` before treating an absence of events as evidence that nothing changed.
 
 ---
 
@@ -209,12 +253,14 @@ Always check `degraded` before treating an absence of events as evidence that no
 
 | Method | |
 |---|---|
-| `subscribe(watch_id)` | Register the caller for callbacks. One entry per address. |
+| `subscribe(watch_id, min_severity=3)` | Register the caller for callbacks at a floor **they** choose. One entry per address. |
 | `unsubscribe(watch_id)` | Remove the caller. |
 
 ### Owner controls
 
-`set_active` · `set_min_severity` · `set_cooldown` · `transfer_watch`
+`set_active` · `set_min_severity` (lower only) · `set_cooldown` (lower only) · `transfer_watch`
+
+There is deliberately no `set_url` and no `update_policy`.
 
 ### Views
 
@@ -222,7 +268,7 @@ Always check `degraded` before treating an absence of events as evidence that no
 
 ### Events
 
-`WatchCreated` · `WatchPolled` · `MaterialChange` · `WatchDegraded`
+`WatchCreated` · `WatchPolled` · `MaterialChange` · `WatchDegraded` · `WatchActiveChanged` · `WatchSensitivityChanged`
 
 ---
 
@@ -260,12 +306,12 @@ pytest tests/direct/ -v
 Integration tests — real consensus over live web and model calls:
 
 ```bash
-gltest tests/integration/ -v -s
+gltest tests/integration/ -v -s --network studionet
 ```
 
 ### Test coverage
 
-26 direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
+35 direct tests. The adversarial cases are the point of the suite; anyone can test a happy path.
 
 | Area | Cases |
 |---|---|
@@ -275,7 +321,8 @@ gltest tests/integration/ -v -s
 | Site misbehaving | fetch failure preserves the snapshot, empty page is a failure not a deletion, repeated failures degrade, a success clears the counter |
 | Model misbehaving | fenced JSON recovered, unparseable extraction fails loudly, unclassifiable change retained not lost |
 | Access control | owner-only mutators, ownership transfer, paused watches, unknown watch ids |
-| Subscriptions | idempotent subscribe, targeted unsubscribe |
+| **Suppression resistance** | min_severity cannot be raised, cooldown cannot be raised, a new owner inherits no reset, url/policy have no setters, pausing and degradation both surface through `reliable` |
+| Subscriptions | idempotent subscribe, subscriber-chosen severity floor, floor range validation, targeted unsubscribe |
 | Cooldown | rapid polling blocked |
 
 ### Notes on the environment
@@ -297,11 +344,36 @@ tests/integration/              consensus tests against a real node
 tests/conftest.py               host workarounds only
 ```
 
-## Status and roadmap
+## Status
 
-Lint passes, 26 direct tests pass. The integration suite is written but needs a funded testnet account or a local node to run — the convergence question it tests (do independent validators actually agree on a canonical snapshot of a live page?) is the one open risk in this design, and it can only be answered against real validators.
+Lint clean. **35 direct tests pass. 3 integration tests pass against real StudioNet consensus.**
 
-Planned next:
+### Deployed
+
+| | |
+|---|---|
+| Network | StudioNet (chain id 61999) |
+| Address | `0x587CB7626AEf6Ab4D523f6B59b1653daB1516220` |
+| Studio | https://studio.genlayer.com/?import-contract=0x587CB7626AEf6Ab4D523f6B59b1653daB1516220 |
+
+### Measured on live consensus
+
+A watch on `https://example.com/` with the policy *"The stated purpose of this domain and any usage or permission notes."* produced this canonical snapshot, agreed by validators:
+
+```json
+[
+  {"key": "allowed_usage",          "value": "documentation_examples"},
+  {"key": "permission_requirement", "value": "none"},
+  {"key": "primary_purpose",        "value": "illustrative_examples"},
+  {"key": "usage_restriction",      "value": "avoid_operational_use"}
+]
+```
+
+Digest `71e196e221894a2188c28732e949ead0495ded776abacddbd669b9a47beab2d8`, **identical across three consecutive polls** — the deterministic gate fires and the classification round is skipped, exactly as designed.
+
+Observed validator behaviour is worth stating plainly: individual votes include occasional `DISAGREE` and `IDLE`. Transactions still reach `ACCEPTED` on quorum. This is the equivalence principle doing its job on a genuinely non-deterministic observation, not a defect — but it does mean a watch should be sized with the expectation that not every validator agrees on every poll.
+
+### Roadmap
 
 - Per-claim severity policies, so one watch can treat pricing as critical and contact details as minor
 - Optional staked poking, letting a watch fund its own cadence
