@@ -12,7 +12,7 @@ change is real but the wording is not.
 
 import json
 
-from conftest import as_address
+from conftest import as_address, warp_to
 
 CONTRACT = "contracts/semantic_watcher.py"
 
@@ -615,3 +615,61 @@ def test_cooldown_blocks_rapid_polling(direct_vm, direct_deploy):
 
     with direct_vm.expect_revert("cooldown"):
         contract.poke(watch_id)
+
+
+def test_cooldown_expires_and_polling_resumes(direct_vm, direct_deploy):
+    """The transition the other cooldown tests cannot reach.
+
+    Direct mode freezes the clock at VM creation, so every call sees the same
+    timestamp and elapsed time is always zero. That covers "blocked while the
+    window is open" and, via cooldown=0, "allowed when there is no window" --
+    but never the crossing between them. `warp()` advances the transaction
+    timestamp so the expiry itself is exercised.
+    """
+    # Pin the clock before creating, so the watch's own timestamp is known.
+    warp_to(direct_vm, "2026-07-26T00:00:00Z")
+    contract, watch_id = baseline(direct_vm, direct_deploy, cooldown=3600)
+    assert contract.get_watch(watch_id)["last_polled_at"] == "2026-07-26T00:00:00Z"
+
+    mock_page(direct_vm, PAGE_V1)
+    direct_vm.mock_llm(EXTRACT_PROMPT, claims())
+
+    with direct_vm.expect_revert("cooldown"):
+        contract.poke(watch_id)
+
+    # Half an hour in: still inside the window.
+    warp_to(direct_vm, "2026-07-26T00:30:00Z")
+    with direct_vm.expect_revert("cooldown"):
+        contract.poke(watch_id)
+
+    # Past the hour: the watch may be polled again.
+    warp_to(direct_vm, "2026-07-26T01:30:00Z")
+    contract.poke(watch_id)
+
+    state = contract.get_watch(watch_id)
+    assert state["total_polls"] == 2
+    assert state["last_polled_at"] == "2026-07-26T01:30:00Z"
+
+
+def test_is_due_tracks_the_cooldown_window(direct_vm, direct_deploy):
+    """is_due must agree with what poke() actually does at every point.
+
+    A caller scheduling pokes trusts this view. If it disagreed with the guard
+    inside poke(), every automated poller would either spam failed
+    transactions or stall forever.
+    """
+    warp_to(direct_vm, "2026-07-26T00:00:00Z")
+    contract, watch_id = baseline(direct_vm, direct_deploy, cooldown=3600)
+
+    assert contract.is_due(watch_id) is False
+
+    warp_to(direct_vm, "2026-07-26T00:59:00Z")
+    assert contract.is_due(watch_id) is False
+
+    warp_to(direct_vm, "2026-07-26T01:00:00Z")
+    assert contract.is_due(watch_id) is True, "due exactly at the boundary"
+
+    # A paused watch is never due, however long has passed.
+    contract.set_active(watch_id, False)
+    warp_to(direct_vm, "2026-07-27T00:00:00Z")
+    assert contract.is_due(watch_id) is False

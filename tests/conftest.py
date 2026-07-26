@@ -28,6 +28,42 @@ def _reset_contract_registry():
     contracts.__known_contract__ = None
 
 
+def warp_to(direct_vm, iso_timestamp: str) -> None:
+    """Advance the transaction timestamp everywhere the contract can read it.
+
+    ``direct_vm.warp()`` alone is not enough. It sets the VM's clock and
+    patches ``datetime.now()``, but its refresh only rewrites ``sender_address``
+    and ``origin_address`` in ``gl.message_raw`` -- the ``datetime`` key is
+    injected once at contract load and never updated.
+
+    A contract that reads time via ``gl.message.raw.datetime`` (the accessor
+    that carries an explicit Z and is correct on-network) therefore sees a
+    frozen clock no matter how many times a test warps. Any cooldown, expiry
+    or freshness rule then tests vacuously: elapsed is always zero.
+
+    This helper warps the VM and rewrites the message datetime together, so
+    time-dependent logic can actually be exercised. It is a harness gap, not a
+    contract concern -- on a real network the transaction timestamp is whatever
+    the transaction carries.
+    """
+    direct_vm.warp(iso_timestamp)
+
+    import sys
+
+    gl = sys.modules.get("genlayer.gl")
+    if gl is None:
+        return
+
+    raw = getattr(gl, "message_raw", None)
+    if isinstance(raw, dict):
+        raw["datetime"] = iso_timestamp
+
+    message = getattr(gl, "message", None)
+    nested = getattr(message, "raw", None)
+    if isinstance(nested, dict):
+        nested["datetime"] = iso_timestamp
+
+
 CONTRACTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "contracts")
 REFERENCE_CONTRACT = os.path.join(CONTRACTS_DIR, "semantic_watcher.py")
 
