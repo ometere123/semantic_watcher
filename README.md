@@ -90,6 +90,32 @@ The shape to notice: **the model is asked what the page says, never what the con
 
 Inside `poke`, all deterministic guards run *before* the first consensus block — watch exists, not paused, cooldown elapsed. A caller who fails a guard never spends a consensus round. The digest gate then sits *between* the two rounds, so an unchanged page costs one round instead of two.
 
+### Does the deterministic logic weaken the case for consensus?
+
+It is a fair question — if so much is decided in ordinary code, why is consensus needed at all? The answer is that **the deterministic logic operates entirely on consensus-agreed data and cannot exist without it.**
+
+Trace what the digest gate actually consumes:
+
+```
+digest(claims) == stored_digest
+        │                │
+        │                └── the previously agreed snapshot   ← consensus output
+        └── the claim set extracted this round                ← consensus output
+```
+
+Both inputs are consensus outputs. Delete the consensus rounds and the gate has nothing to hash — there is no claim set, no snapshot, no page. The same is true of every other deterministic step: the severity comparison needs a severity that only round 2 can produce, and the subscriber fan-out needs a change record that only exists because validators agreed one occurred.
+
+So the deterministic code is not an *alternative* to consensus. It is a **constraint on what the consensus output is permitted to do.** Both halves are load-bearing:
+
+| Remove | Result |
+|---|---|
+| The consensus rounds | Nothing to check. No snapshot, no severity, no observation at all. The contract is inert. |
+| The deterministic logic | The model decides. It can bump a version, wake every subscriber, and mutate the stored snapshot on nothing but its own say-so. |
+
+This is also what GenLayer's own guidance asks for — *"design explicit validation and equivalence rules for every LLM, web, image, or other non-deterministic result."* The deterministic gates **are** those rules. A contract with a large non-deterministic surface and no deterministic constraints is not more GenLayer-native; it is less safe. Keeping the non-deterministic surface **small and essential** is the discipline.
+
+One distinction worth being precise about, since there is a real anti-pattern nearby. *"Validators that only check output format"* is a criticism of a weak **equivalence principle**. Nothing here touches the EPs: round 1 still requires validators to agree that two claim sets carry the same information, and round 2 still requires the severity integers to match exactly. The deterministic checks run *after* consensus, in contract code. They add a constraint; they remove nothing from the equivalence principle.
+
 ---
 
 ## How it works
